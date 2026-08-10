@@ -5,7 +5,6 @@ use crate::entry::deserialize_entries;
 use crate::fec::{FecTracker, IngestResult};
 use crate::shred::{parse_shred, ParsedShred};
 use crate::types::{DecodedInstruction, Dex, InstructionKind, ShredInfo};
-use std::collections::HashSet;
 use udp_listener::UdpShredListener;
 
 pub type ShredCallback = Box<dyn Fn(&ParsedShred) + Send + Sync>;
@@ -19,8 +18,6 @@ pub struct ShredPipeline {
     kind_filter: Option<Vec<InstructionKind>>,
     on_shred: Option<ShredCallback>,
     on_instruction: Option<InstructionCallback>,
-    seen_sigs: HashSet<String>,
-    seen_sigs_slot: u64,
 }
 
 impl ShredPipeline {
@@ -33,8 +30,6 @@ impl ShredPipeline {
             kind_filter: None,
             on_shred: None,
             on_instruction: None,
-            seen_sigs: HashSet::new(),
-            seen_sigs_slot: 0,
         }
     }
 
@@ -142,29 +137,21 @@ impl ShredPipeline {
                 cb(&parsed);
             }
 
-            let (slot, data) = match self.fec_tracker.ingest(&parsed) {
+            let (slot, batches) = match self.fec_tracker.ingest(&parsed) {
                 IngestResult::Pending => continue,
-                IngestResult::SlotComplete(c) => (c.slot, c.data),
-                IngestResult::FirstFecSet { slot, data } => (slot, data),
+                IngestResult::Batches { slot, batches, .. } => (slot, batches),
             };
 
-            // Clear dedup set when we move to a new slot
-            if slot != self.seen_sigs_slot {
-                self.seen_sigs.clear();
-                self.seen_sigs_slot = slot;
-            }
+            for batch in &batches {
+                for inst in self.decode_entries(slot, batch) {
+                    if !self.matches_filters(&inst) {
+                        continue;
+                    }
 
-            for inst in self.decode_entries(slot, &data) {
-                if !self.matches_filters(&inst) {
-                    continue;
-                }
-                if !self.seen_sigs.insert(inst.signature.clone()) {
-                    continue; // already emitted
-                }
-
-                instruction_count += 1;
-                if let Some(cb) = &self.on_instruction {
-                    cb(&inst);
+                    instruction_count += 1;
+                    if let Some(cb) = &self.on_instruction {
+                        cb(&inst);
+                    }
                 }
             }
 
@@ -185,13 +172,15 @@ impl ShredPipeline {
             return Vec::new();
         };
 
-        let (slot, data) = match self.fec_tracker.ingest(&parsed) {
-            IngestResult::SlotComplete(c) => (c.slot, c.data),
-            IngestResult::FirstFecSet { slot, data } => (slot, data),
+        let (slot, batches) = match self.fec_tracker.ingest(&parsed) {
+            IngestResult::Batches { slot, batches, .. } => (slot, batches),
             IngestResult::Pending => return Vec::new(),
         };
 
-        self.decode_entries(slot, &data)
+        batches
+            .iter()
+            .flat_map(|batch| self.decode_entries(slot, batch))
+            .collect()
     }
 
     pub fn parse_shred_info(raw: &[u8]) -> Option<ShredInfo> {

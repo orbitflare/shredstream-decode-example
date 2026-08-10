@@ -9,6 +9,13 @@ const DATA_ERASURE_OFFSET: usize = SIGNATURE_SIZE; // 64
 const CODING_ERASURE_OFFSET: usize = CODING_PAYLOAD_OFFSET; // 89
 
 #[derive(Debug)]
+pub struct RecoveredShred {
+    pub index: u32,
+    pub flags: u8,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug)]
 pub struct FecSet {
     pub slot: u64,
     pub fec_set_index: u32,
@@ -17,10 +24,10 @@ pub struct FecSet {
     variant: Option<ShredVariant>,
     data_raws: Vec<Option<Vec<u8>>>,
     data_payloads: Vec<Option<Vec<u8>>>,
+    data_flags: Vec<Option<u8>>,
     coding_raws: Vec<Option<Vec<u8>>>,
     data_count: usize,
     coding_count: usize,
-    pub last_in_slot: bool,
 }
 
 impl FecSet {
@@ -33,10 +40,10 @@ impl FecSet {
             variant: None,
             data_raws: Vec::new(),
             data_payloads: Vec::new(),
+            data_flags: Vec::new(),
             coding_raws: Vec::new(),
             data_count: 0,
             coding_count: 0,
-            last_in_slot: false,
         }
     }
 
@@ -48,25 +55,23 @@ impl FecSet {
         match shred {
             ParsedShred::Data {
                 common,
+                data,
                 payload,
                 raw,
-                ..
             } => {
                 let local_idx = common.index.saturating_sub(self.fec_set_index) as usize;
 
                 if local_idx >= self.data_raws.len() {
                     self.data_raws.resize_with(local_idx + 1, || None);
                     self.data_payloads.resize_with(local_idx + 1, || None);
+                    self.data_flags.resize_with(local_idx + 1, || None);
                 }
 
                 if self.data_raws[local_idx].is_none() {
                     self.data_raws[local_idx] = Some(raw.clone());
                     self.data_payloads[local_idx] = Some(payload.clone());
+                    self.data_flags[local_idx] = Some(data.flags);
                     self.data_count += 1;
-                }
-
-                if shred.is_last_in_slot() {
-                    self.last_in_slot = true;
                 }
             }
             ParsedShred::Coding { coding, raw, .. } => {
@@ -110,6 +115,8 @@ impl FecSet {
                     .resize_with(coding.num_data_shreds as usize, || None);
                 self.data_payloads
                     .resize_with(coding.num_data_shreds as usize, || None);
+                self.data_flags
+                    .resize_with(coding.num_data_shreds as usize, || None);
             }
             if self.coding_raws.len() < coding.num_coding_shreds as usize {
                 self.coding_raws
@@ -149,6 +156,12 @@ impl FecSet {
         shard
     }
 
+    const SHARD_FLAGS_FIELD: usize = 21;
+
+    fn extract_flags_from_erasure_shard(shard: &[u8]) -> u8 {
+        shard.get(Self::SHARD_FLAGS_FIELD).copied().unwrap_or(0)
+    }
+
     fn extract_payload_from_erasure_shard(shard: &[u8]) -> Vec<u8> {
         const PAYLOAD_START: usize = DATA_PAYLOAD_OFFSET - DATA_ERASURE_OFFSET; // 24
         const SIZE_FIELD: usize = PAYLOAD_START - 2; // 22
@@ -170,12 +183,13 @@ impl FecSet {
         shard[PAYLOAD_START..end_in_shard].to_vec()
     }
 
-    pub fn reassemble(&mut self) -> anyhow::Result<Vec<u8>> {
+    pub fn reassemble(&mut self) -> anyhow::Result<Vec<RecoveredShred>> {
         let num_data = self.num_data.unwrap_or(self.data_raws.len() as u16) as usize;
         let num_coding = self.num_coding.unwrap_or(self.coding_raws.len() as u16) as usize;
 
         self.data_raws.resize_with(num_data, || None);
         self.data_payloads.resize_with(num_data, || None);
+        self.data_flags.resize_with(num_data, || None);
         self.coding_raws.resize_with(num_coding, || None);
 
         let all_data_present = self
@@ -185,15 +199,17 @@ impl FecSet {
             .all(|s| s.is_some());
 
         if all_data_present {
-            let mut result = Vec::new();
-            for payload in self.data_payloads.iter().take(num_data) {
-                result.extend_from_slice(payload.as_ref().unwrap());
-            }
+            let result: Vec<RecoveredShred> = (0..num_data)
+                .map(|i| RecoveredShred {
+                    index: self.fec_set_index + i as u32,
+                    flags: self.data_flags[i].unwrap_or(0),
+                    payload: self.data_payloads[i].take().unwrap(),
+                })
+                .collect();
             tracing::debug!(
                 slot = self.slot,
                 fec_idx = self.fec_set_index,
                 num_data,
-                total_len = result.len(),
                 "FEC reassembly (fast path)"
             );
             return Ok(result);
@@ -231,14 +247,23 @@ impl FecSet {
 
         recover_shards(num_data, num_coding, &mut shards)?;
 
-        let mut result = Vec::new();
+        let mut result = Vec::with_capacity(num_data);
         for (i, shard) in shards.iter().enumerate().take(num_data) {
             match shard {
                 Some(data) => {
-                    if let Some(Some(payload)) = self.data_payloads.get(i) {
-                        result.extend_from_slice(payload);
+                    let index = self.fec_set_index + i as u32;
+                    if let Some(Some(payload)) = self.data_payloads.get_mut(i) {
+                        result.push(RecoveredShred {
+                            index,
+                            flags: self.data_flags[i].unwrap_or(0),
+                            payload: std::mem::take(payload),
+                        });
                     } else {
-                        result.extend_from_slice(&Self::extract_payload_from_erasure_shard(data));
+                        result.push(RecoveredShred {
+                            index,
+                            flags: Self::extract_flags_from_erasure_shard(data),
+                            payload: Self::extract_payload_from_erasure_shard(data),
+                        });
                     }
                 }
                 None => anyhow::bail!("Data shard {i} still missing after recovery"),
@@ -249,7 +274,6 @@ impl FecSet {
             slot = self.slot,
             fec_idx = self.fec_set_index,
             recovered = num_data - self.data_count,
-            total_len = result.len(),
             "FEC reassembly (RS recovery)"
         );
 

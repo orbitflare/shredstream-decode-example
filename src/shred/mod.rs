@@ -52,7 +52,7 @@ impl ParsedShred {
 
     pub fn is_last_in_slot(&self) -> bool {
         match self {
-            ParsedShred::Data { data, .. } => data.flags & data_header::FLAG_LAST_IN_SLOT != 0,
+            ParsedShred::Data { data, .. } => data_header::is_last_in_slot(data.flags),
             _ => false,
         }
     }
