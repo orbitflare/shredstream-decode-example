@@ -3,7 +3,6 @@ use crate::shred::coding_header::CodingHeader;
 use crate::shred::coding_header::CODING_PAYLOAD_OFFSET;
 use crate::shred::common_header::{ShredVariant, SIGNATURE_SIZE};
 use crate::shred::data_header::DATA_PAYLOAD_OFFSET;
-use crate::shred::ParsedShred;
 
 const DATA_ERASURE_OFFSET: usize = SIGNATURE_SIZE; // 64
 const CODING_ERASURE_OFFSET: usize = CODING_PAYLOAD_OFFSET; // 89
@@ -23,8 +22,6 @@ pub struct FecSet {
     num_coding: Option<u16>,
     variant: Option<ShredVariant>,
     data_raws: Vec<Option<Vec<u8>>>,
-    data_payloads: Vec<Option<Vec<u8>>>,
-    data_flags: Vec<Option<u8>>,
     coding_raws: Vec<Option<Vec<u8>>>,
     data_count: usize,
     coding_count: usize,
@@ -39,54 +36,46 @@ impl FecSet {
             num_coding: None,
             variant: None,
             data_raws: Vec::new(),
-            data_payloads: Vec::new(),
-            data_flags: Vec::new(),
             coding_raws: Vec::new(),
             data_count: 0,
             coding_count: 0,
         }
     }
 
-    pub fn insert(&mut self, shred: &ParsedShred) -> bool {
+    pub fn insert_data(&mut self, variant: ShredVariant, index: u32, raw: Vec<u8>) -> bool {
         if self.variant.is_none() {
-            self.variant = Some(shred.common().variant);
+            self.variant = Some(variant);
         }
 
-        match shred {
-            ParsedShred::Data {
-                common,
-                data,
-                payload,
-                raw,
-            } => {
-                let local_idx = common.index.saturating_sub(self.fec_set_index) as usize;
+        let local_idx = index.saturating_sub(self.fec_set_index) as usize;
 
-                if local_idx >= self.data_raws.len() {
-                    self.data_raws.resize_with(local_idx + 1, || None);
-                    self.data_payloads.resize_with(local_idx + 1, || None);
-                    self.data_flags.resize_with(local_idx + 1, || None);
-                }
+        if local_idx >= self.data_raws.len() {
+            self.data_raws.resize_with(local_idx + 1, || None);
+        }
 
-                if self.data_raws[local_idx].is_none() {
-                    self.data_raws[local_idx] = Some(raw.clone());
-                    self.data_payloads[local_idx] = Some(payload.clone());
-                    self.data_flags[local_idx] = Some(data.flags);
-                    self.data_count += 1;
-                }
-            }
-            ParsedShred::Coding { coding, raw, .. } => {
-                self.set_fec_params(coding);
-                let position = coding.position as usize;
+        if self.data_raws[local_idx].is_none() {
+            self.data_raws[local_idx] = Some(raw);
+            self.data_count += 1;
+        }
 
-                if position >= self.coding_raws.len() {
-                    self.coding_raws.resize_with(position + 1, || None);
-                }
+        self.is_complete()
+    }
 
-                if self.coding_raws[position].is_none() {
-                    self.coding_raws[position] = Some(raw.clone());
-                    self.coding_count += 1;
-                }
-            }
+    pub fn insert_coding(&mut self, variant: ShredVariant, coding: &CodingHeader, raw: Vec<u8>) -> bool {
+        if self.variant.is_none() {
+            self.variant = Some(variant);
+        }
+
+        self.set_fec_params(coding);
+        let position = coding.position as usize;
+
+        if position >= self.coding_raws.len() {
+            self.coding_raws.resize_with(position + 1, || None);
+        }
+
+        if self.coding_raws[position].is_none() {
+            self.coding_raws[position] = Some(raw);
+            self.coding_count += 1;
         }
 
         self.is_complete()
@@ -112,10 +101,6 @@ impl FecSet {
 
             if self.data_raws.len() < coding.num_data_shreds as usize {
                 self.data_raws
-                    .resize_with(coding.num_data_shreds as usize, || None);
-                self.data_payloads
-                    .resize_with(coding.num_data_shreds as usize, || None);
-                self.data_flags
                     .resize_with(coding.num_data_shreds as usize, || None);
             }
             if self.coding_raws.len() < coding.num_coding_shreds as usize {
@@ -188,31 +173,12 @@ impl FecSet {
         let num_coding = self.num_coding.unwrap_or(self.coding_raws.len() as u16) as usize;
 
         self.data_raws.resize_with(num_data, || None);
-        self.data_payloads.resize_with(num_data, || None);
-        self.data_flags.resize_with(num_data, || None);
         self.coding_raws.resize_with(num_coding, || None);
 
-        let all_data_present = self
-            .data_payloads
-            .iter()
-            .take(num_data)
-            .all(|s| s.is_some());
+        let all_data_present = self.data_raws.iter().take(num_data).all(|s| s.is_some());
 
         if all_data_present {
-            let result: Vec<RecoveredShred> = (0..num_data)
-                .map(|i| RecoveredShred {
-                    index: self.fec_set_index + i as u32,
-                    flags: self.data_flags[i].unwrap_or(0),
-                    payload: self.data_payloads[i].take().unwrap(),
-                })
-                .collect();
-            tracing::debug!(
-                slot = self.slot,
-                fec_idx = self.fec_set_index,
-                num_data,
-                "FEC reassembly (fast path)"
-            );
-            return Ok(result);
+            return Ok(Vec::new());
         }
 
         let shard_size = self.compute_erasure_shard_size();
@@ -247,24 +213,18 @@ impl FecSet {
 
         recover_shards(num_data, num_coding, &mut shards)?;
 
-        let mut result = Vec::with_capacity(num_data);
+        let mut result = Vec::with_capacity(num_data - self.data_count);
         for (i, shard) in shards.iter().enumerate().take(num_data) {
+            if self.data_raws[i].is_some() {
+                continue;
+            }
             match shard {
                 Some(data) => {
-                    let index = self.fec_set_index + i as u32;
-                    if let Some(Some(payload)) = self.data_payloads.get_mut(i) {
-                        result.push(RecoveredShred {
-                            index,
-                            flags: self.data_flags[i].unwrap_or(0),
-                            payload: std::mem::take(payload),
-                        });
-                    } else {
-                        result.push(RecoveredShred {
-                            index,
-                            flags: Self::extract_flags_from_erasure_shard(data),
-                            payload: Self::extract_payload_from_erasure_shard(data),
-                        });
-                    }
+                    result.push(RecoveredShred {
+                        index: self.fec_set_index + i as u32,
+                        flags: Self::extract_flags_from_erasure_shard(data),
+                        payload: Self::extract_payload_from_erasure_shard(data),
+                    });
                 }
                 None => anyhow::bail!("Data shard {i} still missing after recovery"),
             }
