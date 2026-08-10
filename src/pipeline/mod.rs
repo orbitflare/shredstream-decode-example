@@ -112,11 +112,27 @@ impl ShredPipeline {
         let listener = UdpShredListener::bind(&self.bind_addr).await?;
         tracing::info!(bind = %self.bind_addr, "ShredPipeline started");
 
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                match listener.recv().await {
+                    Ok(raw) => {
+                        if tx.send(raw).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "UDP recv failed");
+                        break;
+                    }
+                }
+            }
+        });
+
         let mut shred_count: u64 = 0;
         let mut instruction_count: u64 = 0;
 
-        loop {
-            let raw = listener.recv().await?;
+        while let Some(raw) = rx.recv().await {
             shred_count += 1;
 
             tracing::debug!(shred_count, len = raw.len(), "Received UDP packet");
@@ -137,7 +153,7 @@ impl ShredPipeline {
                 cb(&parsed);
             }
 
-            let (slot, batches) = match self.fec_tracker.ingest(&parsed) {
+            let (slot, batches) = match self.fec_tracker.ingest(parsed) {
                 IngestResult::Pending => continue,
                 IngestResult::Batches { slot, batches, .. } => (slot, batches),
             };
@@ -165,6 +181,8 @@ impl ShredPipeline {
                 );
             }
         }
+
+        anyhow::bail!("UDP listener stopped")
     }
 
     pub fn process_raw(&mut self, raw: &[u8]) -> Vec<DecodedInstruction> {
@@ -172,7 +190,7 @@ impl ShredPipeline {
             return Vec::new();
         };
 
-        let (slot, batches) = match self.fec_tracker.ingest(&parsed) {
+        let (slot, batches) = match self.fec_tracker.ingest(parsed) {
             IngestResult::Batches { slot, batches, .. } => (slot, batches),
             IngestResult::Pending => return Vec::new(),
         };
