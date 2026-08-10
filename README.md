@@ -9,8 +9,10 @@ Shred parsing is done from scratch (no `solana-ledger`) so you can see exactly h
 ## Pipeline
 
 ```
-UDP packets → parse shred headers → collect FEC sets → Reed-Solomon recovery → deserialize entries → decode instructions
+UDP packets → parse shred headers → collect FEC sets → Reed-Solomon recovery → assemble entry batches → deserialize entries → decode instructions
 ```
+
+Entry batches are decoded incrementally: each batch is emitted as soon as its shreds are contiguous (marked by the `DATA_COMPLETE_SHRED` flag), without waiting for the rest of the slot to arrive.
 
 ## Supported Examples
 
@@ -90,7 +92,7 @@ cargo run --example token_mints             # SPL token mints
 ```
 src/
 ├── shred/           # binary shred parsing (headers, payload extraction)
-├── fec/             # FEC set tracking, Reed-Solomon recovery, slot accumulation
+├── fec/             # FEC set tracking, Reed-Solomon recovery, entry batch assembly
 ├── entry/           # bincode deserialization of entries into transactions
 ├── decoder/         # instruction decoders (pumpfun, jupiter, raydium, spl_token)
 ├── pipeline/        # ties it all together -UDP listener → decode → callback
