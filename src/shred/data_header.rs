@@ -4,13 +4,22 @@ pub const DATA_HEADER_SIZE: usize = 5;
 pub const DATA_HEADER_OFFSET: usize = COMMON_HEADER_SIZE;
 pub const DATA_PAYLOAD_OFFSET: usize = COMMON_HEADER_SIZE + DATA_HEADER_SIZE; // 88
 
-pub const FLAG_LAST_IN_SLOT: u8 = 0x02;
+pub const FLAG_DATA_COMPLETE_SHRED: u8 = 0b0100_0000;
+pub const FLAG_LAST_SHRED_IN_SLOT: u8 = 0b1100_0000;
 
 #[derive(Debug, Clone)]
 pub struct DataHeader {
     pub parent_offset: u16,
     pub flags: u8,
     pub size: u16,
+}
+
+pub fn is_data_complete(flags: u8) -> bool {
+    flags & FLAG_DATA_COMPLETE_SHRED != 0
+}
+
+pub fn is_last_in_slot(flags: u8) -> bool {
+    flags & FLAG_LAST_SHRED_IN_SLOT == FLAG_LAST_SHRED_IN_SLOT
 }
 
 pub fn parse_data_header(data: &[u8]) -> Option<DataHeader> {
