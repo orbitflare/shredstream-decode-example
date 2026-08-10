@@ -9,10 +9,10 @@ Shred parsing is done from scratch (no `solana-ledger`) so you can see exactly h
 ## Pipeline
 
 ```
-UDP packets → parse shred headers → collect FEC sets → Reed-Solomon recovery → assemble entry batches → deserialize entries → decode instructions
+UDP packets → parse shred headers → assemble entry batches → deserialize entries → decode instructions
 ```
 
-Entry batches are decoded incrementally: each batch is emitted as soon as its shreds are contiguous (marked by the `DATA_COMPLETE_SHRED` flag), without waiting for the rest of the slot to arrive.
+Entry batches are decoded incrementally: data shreds feed the assembler the moment they arrive, and each batch is emitted as soon as its shreds are contiguous (marked by the `DATA_COMPLETE_SHRED` flag), without waiting for the rest of the slot. FEC sets are tracked in parallel; Reed-Solomon recovery backfills only the shreds that were lost in transit.
 
 ## Supported Examples
 
