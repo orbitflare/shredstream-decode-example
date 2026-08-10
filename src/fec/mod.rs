@@ -1,22 +1,16 @@
 pub mod fec_set;
 pub mod reed_solomon;
-pub mod slot_accumulator;
+pub mod slot_assembler;
 
 use crate::shred::ParsedShred;
 use fec_set::FecSet;
-use slot_accumulator::SlotAccumulator;
+use slot_assembler::SlotAssembler;
 use std::collections::{HashMap, HashSet};
-
-pub struct CompletedSlot {
-    pub slot: u64,
-    pub data: Vec<u8>,
-    pub fec_set_count: usize,
-}
 
 pub struct FecTracker {
     sets: HashMap<(u64, u32), FecSet>,
     completed: HashSet<(u64, u32)>,
-    slots: HashMap<u64, SlotAccumulator>,
+    slots: HashMap<u64, SlotAssembler>,
     completed_slots: HashSet<u64>,
     max_slot: u64,
     eviction_threshold: u64,
@@ -24,11 +18,11 @@ pub struct FecTracker {
 
 pub enum IngestResult {
     Pending,
-    FirstFecSet {
+    Batches {
         slot: u64,
-        data: Vec<u8>,
+        batches: Vec<Vec<u8>>,
+        slot_complete: bool,
     },
-    SlotComplete(CompletedSlot),
 }
 
 impl FecTracker {
@@ -72,65 +66,51 @@ impl FecTracker {
             None => return IngestResult::Pending,
         };
 
-        let last_in_slot = set.last_in_slot;
-
-        let data = match set.reassemble() {
-            Ok(d) => d,
+        let shreds = match set.reassemble() {
+            Ok(s) => s,
             Err(e) => {
                 tracing::warn!(slot, fec_idx, error = %e, "FEC reassembly failed");
                 return IngestResult::Pending;
             }
         };
 
-        let acc = self
+        let asm = self
             .slots
             .entry(slot)
-            .or_insert_with(|| SlotAccumulator::new(slot));
+            .or_insert_with(|| SlotAssembler::new(slot));
 
-        let is_first = acc.fec_set_count() == 0 && fec_idx == 0;
+        for s in shreds {
+            asm.insert(s);
+        }
 
-        acc.add_fec_set(fec_idx, data, last_in_slot);
+        let batches = asm.drain_batches();
+        let slot_complete = asm.is_complete();
 
-        if acc.is_complete() {
-            let acc = self.slots.remove(&slot).unwrap();
+        if slot_complete {
+            let asm = self.slots.remove(&slot).unwrap();
             self.completed_slots.insert(slot);
-            let full_data = acc.concatenate();
-
             tracing::debug!(
                 slot,
-                fec_sets = acc.fec_set_count(),
-                total_bytes = full_data.len(),
+                batches = asm.batches_emitted(),
                 "Slot complete"
             );
+        } else if !batches.is_empty() {
+            tracing::debug!(
+                slot,
+                fec_idx,
+                new_batches = batches.len(),
+                "Entry batches complete, slot incomplete"
+            );
+        }
 
-            IngestResult::SlotComplete(CompletedSlot {
-                slot,
-                data: full_data,
-                fec_set_count: acc.fec_set_count(),
-            })
-        } else if is_first {
-            // Return a clone of the first FEC set's data for greedy parsing.
-            // Only the first FEC set (fec_idx=0) has the Vec<Entry> length header,
-            // so only it is usable for greedy deserialization.
-            let first_data = acc.fec_sets_ref().get(&0).unwrap().clone();
-            tracing::debug!(
-                slot,
-                fec_idx,
-                fec_sets_so_far = acc.fec_set_count(),
-                "First FEC set complete, slot incomplete"
-            );
-            IngestResult::FirstFecSet {
-                slot,
-                data: first_data,
-            }
-        } else {
-            tracing::debug!(
-                slot,
-                fec_idx,
-                fec_sets_so_far = acc.fec_set_count(),
-                "FEC set complete, slot incomplete"
-            );
+        if batches.is_empty() {
             IngestResult::Pending
+        } else {
+            IngestResult::Batches {
+                slot,
+                batches,
+                slot_complete,
+            }
         }
     }
 
